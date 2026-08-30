@@ -3,7 +3,7 @@
 本项目是一个面向本地运行、文件优先、可审计的 Agent 工作台。
 
 - 对话、工具调用、检索过程都会落到本地文件
-- 长期记忆使用可直接编辑的 `Markdown`
+- 长期记忆由 PostgreSQL + pgvector 的 `MemoryManager` 统一管理
 - 技能不是黑盒函数，而是可读可改的 `SKILL.md`
 - 前端可以直接看到流式回复、工具链路和检索证据
 
@@ -92,7 +92,7 @@ flowchart LR
 - 知识检索编排：[backend/knowledge_retrieval/orchestrator.py](backend/knowledge_retrieval/orchestrator.py)
 - 向量 / BM25 索引：[backend/knowledge_retrieval/indexer.py](backend/knowledge_retrieval/indexer.py)
 - 混合检索：[backend/knowledge_retrieval/hybrid_retriever.py](backend/knowledge_retrieval/hybrid_retriever.py)
-- 技能检索代理：[backend/knowledge_retrieval/skill_retriever_agent.py](backend/knowledge_retrieval/skill_retriever_agent.py)
+- 技能检索代理：[backend/knowledge_retrieval/knowledge_retriever_agent.py](backend/knowledge_retrieval/knowledge_retriever_agent.py)
 
 ## 系统结构
 
@@ -127,6 +127,7 @@ ragclaw/
 - Uvicorn
 - LangChain 1.x
 - LlamaIndex
+- PostgreSQL + pgvector（长期记忆）
 - OpenAI-compatible model API
 - Ragas（用于离线评估）
 
