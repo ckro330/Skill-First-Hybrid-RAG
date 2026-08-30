@@ -7,6 +7,7 @@ import {
   createSession,
   deleteSession,
   getKnowledgeIndexStatus,
+  getMemoryMode,
   getRagMode,
   getSessionHistory,
   getSessionTokens,
@@ -17,6 +18,7 @@ import {
   rebuildKnowledgeIndex as rebuildKnowledgeIndexRequest,
   saveFile,
   setRagMode,
+  setMemoryMode,
   streamChat,
   type Evidence,
   type KnowledgeIndexStatus,
@@ -45,6 +47,7 @@ type AppStore = {
   messages: Message[];
   isStreaming: boolean;
   ragMode: boolean;
+  memoryMode: boolean;
   skills: Array<{ name: string; description: string; path: string }>;
   editableFiles: string[];
   inspectorPath: string;
@@ -58,8 +61,10 @@ type AppStore = {
   selectSession: (sessionId: string) => Promise<void>;
   sendMessage: (value: string) => Promise<void>;
   toggleRagMode: () => Promise<void>;
+  toggleMemoryMode: () => Promise<void>;
   renameCurrentSession: (title: string) => Promise<void>;
   removeSession: (sessionId: string) => Promise<void>;
+  exportSessionLog: () => Promise<void>;
   loadInspectorFile: (path: string) => Promise<void>;
   updateInspectorContent: (value: string) => void;
   saveInspector: () => Promise<void>;
@@ -74,7 +79,6 @@ const FIXED_FILES = [
   "workspace/IDENTITY.md",
   "workspace/USER.md",
   "workspace/AGENTS.md",
-  "memory/MEMORY.md",
   "SKILLS_SNAPSHOT.md"
 ];
 
@@ -147,8 +151,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [ragMode, setRagModeState] = useState(false);
+  const [memoryMode, setMemoryModeState] = useState(false);
   const [skills, setSkills] = useState<Array<{ name: string; description: string; path: string }>>([]);
-  const [inspectorPath, setInspectorPath] = useState("memory/MEMORY.md");
+  const [inspectorPath, setInspectorPath] = useState("workspace/USER.md");
   const [inspectorContent, setInspectorContent] = useState("");
   const [inspectorDirty, setInspectorDirty] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(308);
@@ -351,6 +356,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  async function toggleMemoryMode() {
+    const next = !memoryMode;
+    setMemoryModeState(next);
+    try {
+      await setMemoryMode(next);
+    } catch (error) {
+      setMemoryModeState(!next);
+      throw error;
+    }
+  }
+
   async function renameCurrentSession(title: string) {
     if (!currentSessionId || !title.trim()) {
       return;
@@ -374,6 +390,29 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setTokenStats(null);
       }
     }
+  }
+
+  async function exportSessionLog() {
+    if (!currentSessionId) {
+      return;
+    }
+    const history = await getSessionHistory(currentSessionId);
+    const payload = {
+      exported_at: new Date().toISOString(),
+      session_id: currentSessionId,
+      session: history,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `session-${currentSessionId}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   }
 
   async function loadInspectorFile(path: string) {
@@ -410,15 +449,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     void (async () => {
-      const [initialSessions, rag, initialSkills, initialKnowledgeIndexStatus] = await Promise.all([
+      const [initialSessions, rag, memory, initialSkills, initialKnowledgeIndexStatus] = await Promise.all([
         listSessions(),
         getRagMode(),
+        getMemoryMode(),
         listSkills(),
         getKnowledgeIndexStatus()
       ]);
 
       setSessions(initialSessions);
       setRagModeState(rag.enabled);
+      setMemoryModeState(memory.enabled);
       setSkills(initialSkills);
       setKnowledgeIndexStatus(initialKnowledgeIndexStatus);
 
@@ -431,7 +472,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setSessions([created]);
       }
 
-      const file = await loadFile("memory/MEMORY.md");
+      const file = await loadFile("workspace/USER.md");
       setInspectorPath(file.path);
       setInspectorContent(file.content);
     })();
@@ -455,6 +496,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     messages,
     isStreaming,
     ragMode,
+    memoryMode,
     skills,
     editableFiles,
     inspectorPath,
@@ -468,8 +510,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     selectSession,
     sendMessage,
     toggleRagMode,
+    toggleMemoryMode,
     renameCurrentSession,
     removeSession,
+    exportSessionLog,
     loadInspectorFile,
     updateInspectorContent,
     saveInspector,

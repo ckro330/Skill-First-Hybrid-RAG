@@ -157,6 +157,17 @@ export async function setRagMode(enabled: boolean) {
   });
 }
 
+export async function getMemoryMode() {
+  return request<{ enabled: boolean }>("/config/memory-mode");
+}
+
+export async function setMemoryMode(enabled: boolean) {
+  return request<{ enabled: boolean }>("/config/memory-mode", {
+    method: "PUT",
+    body: JSON.stringify({ enabled })
+  });
+}
+
 export async function compressSession(sessionId: string) {
   return request<{ archived_count: number; remaining_count: number }>(
     `/sessions/${sessionId}/compress`,

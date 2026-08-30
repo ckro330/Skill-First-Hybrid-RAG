@@ -28,6 +28,7 @@ def _new_segment() -> dict[str, Any]:
 
 @router.post("/chat")
 async def chat(payload: ChatRequest):
+#寻找用户的对话id
     session_manager = agent_manager.session_manager
     if session_manager is None:
         raise HTTPException(status_code=503, detail="Agent manager is not initialized")
@@ -45,6 +46,7 @@ async def chat(payload: ChatRequest):
         conversation_saved = False
 
         def persist_segments(fallback_content: str | None = None) -> None:
+            #塞入current_segment和conversation_saved，在调用的时候改变
             nonlocal current_segment, conversation_saved
             if conversation_saved:
                 return
@@ -78,7 +80,11 @@ async def chat(payload: ChatRequest):
             conversation_saved = True
 
         try:
-            async for event in agent_manager.astream(payload.message, history):
+            async for event in agent_manager.astream(
+                payload.message,
+                history,
+                compressed_context=history_record.get("compressed_context", ""),
+            ):
                 event_type = event["type"]
 
                 if event_type == "token":

@@ -12,7 +12,7 @@
 ## 项目特点
 
 - 本地优先：后端和前端都可以直接本地启动，不依赖 MySQL / Redis
-- 文件即事实源：`memory/`、`workspace/` 和本地 `knowledge/` 都是可见、可改、可版本管理的文件
+- 文件即事实源：`workspace/` 和本地 `knowledge/` 都是可见、可改、可版本管理的文件
 - Prompt 可解释：系统提示词由多个 Markdown 文件实时组装
 - 技能可审计：每个技能都是 `skills/*/SKILL.md`
 - 检索可观测：前端会展示知识检索步骤、证据来源和工具调用
@@ -21,11 +21,11 @@
 
 - FastAPI + SSE 流式聊天
 - 会话持久化到 `backend/sessions/*.json`
-- 长期记忆文件：`backend/memory/MEMORY.md`
-- 可切换的记忆 RAG 模式
+- 长期记忆：PostgreSQL + pgvector（`MemoryManager` 统一入口）
+- 可切换的记忆检索（memory 开关）与知识库 RAG（rag 开关）
 - 本地知识库检索
 - 前端三栏工作台
-- 在线编辑 Memory / Skills / Workspace 文件
+- 在线编辑 Skills / Workspace 文件
 - 检索证据、工具调用、Raw Messages 可视化
 
 当前内置技能包括：
@@ -55,8 +55,9 @@
 
 ```mermaid
 flowchart LR
-    U["用户问题"] --> A["Agent 识别知识库请求"]
-    A --> S["Skill Retriever Agent"]
+    U["用户问题"] --> A["Skill Router 三层决策"]
+    A -- "选择 rag-skill" --> S["Skill Retriever Agent"]
+    A -- "NONE / 其他技能" --> G["主 Agent（按需读取对应 SKILL.md）"]
     S --> D{"Skill 证据是否足够?"}
     D -- "是" --> R["直接基于 Skill 证据回答"]
     D -- "否" --> V["向量检索"]
@@ -70,6 +71,9 @@ flowchart LR
 
 ### 当前实现范围
 
+- 请求进入 Agent 前，先由三层 Skill Router 决定技能：L1 指令判断（`/` 开头，占位）→ L2 向量（sentence-transformers）+ BM25（rank_bm25）+ RRF 混合检索 → L3 仅当 L2 不确定时才调用轻量 LLM 在候选中决策
+- L2 唯一命中时直接采用、不调用路由 LLM；无候选时 L3 从全部技能中选择（此时只传 name + description）
+- 路由选中 `rag-skill` 时进入知识检索链路，选中其他技能时主 Agent 先读取对应 SKILL.md 再执行，无合适技能则走普通对话
 - `skill` 检索始终优先执行
 - 当 `skill` 结果为 `partial / not_found / uncertain` 时，才触发混合检索兜底
 - 混合检索当前由：
@@ -84,6 +88,7 @@ flowchart LR
 
 - 后端入口：[backend/app.py](backend/app.py)
 - Agent 主入口：[backend/graph/agent.py](backend/graph/agent.py)
+- Skill 路由决策：[backend/graph/skill_router.py](backend/graph/skill_router.py)
 - 知识检索编排：[backend/knowledge_retrieval/orchestrator.py](backend/knowledge_retrieval/orchestrator.py)
 - 向量 / BM25 索引：[backend/knowledge_retrieval/indexer.py](backend/knowledge_retrieval/indexer.py)
 - 混合检索：[backend/knowledge_retrieval/hybrid_retriever.py](backend/knowledge_retrieval/hybrid_retriever.py)
@@ -98,7 +103,7 @@ ragclaw/
 │  ├─ graph/                  # Agent、prompt、session、memory 相关逻辑
 │  ├─ knowledge/              # 仓库内置示例知识库
 │  ├─ knowledge_retrieval/    # Skill 优先 + hybrid fallback 检索链路
-│  ├─ memory/                 # 长期记忆文件
+│  ├─ memory/                 # 长期记忆：MemoryManager + pgvector Repository
 │  ├─ scripts/                # 评测与辅助脚本
 │  ├─ sessions/               # 会话历史
 │  ├─ skills/                 # 技能目录，每个技能核心是 SKILL.md
@@ -137,18 +142,19 @@ ragclaw/
 
 代码层默认配置见 [backend/config.py](backend/config.py)：
 
-- LLM Provider: `zhipu`
-- LLM Model: `glm-5`
-- Embedding Provider: `bailian`
-- Embedding Model: `text-embedding-v4`
+- LLM Provider: `deepseek`
+- LLM Model: `deepseek-v4-flash`
+- Embedding Provider: `local`（sentence-transformers 本地模型，无需 API key）
+- Embedding Model: `BAAI/bge-small-zh-v1.5`
 
 示例环境文件 [backend/.env.example](backend/.env.example) 默认使用：
 
-- LLM Provider: `zhipu`
-- Embedding Provider: `zhipu`
+- LLM Provider: `deepseek`
+- Embedding Provider: `local`
 
 也支持：
 
+- `local`（仅 embedding）
 - `zhipu`
 - `bailian`
 - `deepseek`
@@ -166,13 +172,10 @@ ragclaw/
 最少建议配置：
 
 ```env
-LLM_PROVIDER=zhipu
-LLM_MODEL=glm-5
-ZHIPU_API_KEY=your_key
+DEEPSEEK_API_KEY=your_key
 
-EMBEDDING_PROVIDER=zhipu
-EMBEDDING_MODEL=embedding-3
-EMBEDDING_API_KEY=your_key
+EMBEDDING_PROVIDER=local
+EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 
 TAVILY_API_KEY=your_key
 ```
@@ -226,7 +229,7 @@ $env:NEXT_PUBLIC_API_BASE_URL="http://127.0.0.1:8010/api"
 
 1. 启动前后端，发送一条普通聊天消息，确认流式输出正常
 2. 打开右侧 Inspector，查看工具调用和 Raw Messages
-3. 试着编辑 `backend/memory/MEMORY.md`
+3. 打开记忆开关，观察 Memory 检索步骤是否注入 Agent 上下文
 4. 提一个知识库问题，观察 Skill 检索和 fallback 检索是否出现
 5. 查看 `backend/sessions/*.json`，确认消息、工具和检索记录已落盘
 

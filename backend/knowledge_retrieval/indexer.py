@@ -72,10 +72,17 @@ class KnowledgeIndexer:
         return self._storage_dir / "derived"
 
     def _supports_embeddings(self) -> bool:
-        return bool(get_settings().embedding_api_key)
-
-    def _build_embed_model(self) -> OpenAIEmbedding:
         settings = get_settings()
+        if settings.embedding_provider == "local":
+            return True
+        return bool(settings.embedding_api_key)
+
+    def _build_embed_model(self) -> Any:
+        settings = get_settings()
+        if settings.embedding_provider == "local":
+            from knowledge_retrieval.embeddings import LocalEmbedding
+
+            return LocalEmbedding()
         return OpenAIEmbedding(
             api_key=settings.embedding_api_key,
             api_base=settings.embedding_base_url,

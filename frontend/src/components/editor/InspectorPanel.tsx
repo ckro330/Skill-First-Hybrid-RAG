@@ -23,7 +23,7 @@ export function InspectorPanel() {
           <p className="text-xs uppercase tracking-[0.28em] text-[var(--color-ink-soft)]">
             Inspector
           </p>
-          <h2 className="text-lg font-semibold tracking-[-0.04em]">Memory / Skills / Prompt</h2>
+          <h2 className="text-lg font-semibold tracking-[-0.04em]">Skills / Workspace / Prompt</h2>
         </div>
         <button
           className="flex items-center gap-2 rounded-full bg-[rgba(15,139,141,0.12)] px-4 py-2 text-sm text-ocean"

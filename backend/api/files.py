@@ -7,12 +7,11 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from graph.agent import agent_manager
-from graph.memory_indexer import memory_indexer
 from tools.skills_scanner import refresh_snapshot, scan_skills
 
 router = APIRouter()
 
-ALLOWED_PREFIXES = ("workspace/", "memory/", "skills/", "knowledge/")
+ALLOWED_PREFIXES = ("workspace/", "skills/", "knowledge/")
 ALLOWED_ROOT_FILES = {"SKILLS_SNAPSHOT.md"}
 
 
@@ -54,8 +53,6 @@ async def save_file(payload: SaveFileRequest) -> dict[str, Any]:
     file_path.write_text(payload.content, encoding="utf-8")
 
     normalized = payload.path.replace("\\", "/")
-    if normalized == "memory/MEMORY.md":
-        memory_indexer.rebuild_index()
     if normalized.startswith("skills/"):
         refresh_snapshot(agent_manager.base_dir)
 

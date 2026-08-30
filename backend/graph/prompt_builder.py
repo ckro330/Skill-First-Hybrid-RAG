@@ -10,7 +10,6 @@ SYSTEM_COMPONENTS: tuple[tuple[str, str], ...] = (
     ("Identity", "workspace/IDENTITY.md"),
     ("User Profile", "workspace/USER.md"),
     ("Agents Guide", "workspace/AGENTS.md"),
-    ("Long-term Memory", "memory/MEMORY.md"),
 )
 
 RUNTIME_OVERRIDE = """<!-- Runtime Override -->
@@ -32,21 +31,18 @@ def _read_component(base_dir: Path, relative_path: str, limit: int) -> str:
     return _truncate(path.read_text(encoding="utf-8"), limit)
 
 
-def build_system_prompt(base_dir: Path, rag_mode: bool) -> str:
+def build_system_prompt(base_dir: Path) -> str:
     settings = get_settings()
     parts: list[str] = []
 
     for label, relative_path in SYSTEM_COMPONENTS:
-        if rag_mode and relative_path == "memory/MEMORY.md":
-            parts.append(
-                "<!-- Long-term Memory -->\n"
-                "长期记忆将通过检索动态注入。你应优先使用当次检索到的 MEMORY 片段，"
-                "不要假设未检索到的记忆仍然有效。"
-            )
-            continue
-
         content = _read_component(base_dir, relative_path, settings.component_char_limit)
         parts.append(f"<!-- {label} -->\n{content}")
 
+    parts.append(
+        "<!-- Long-term Memory -->\n"
+        "长期记忆由 MemoryManager 按需检索动态注入。"
+        "你应优先使用当次检索到的记忆片段，不要假设未检索到的记忆仍然有效。"
+    )
     parts.append(RUNTIME_OVERRIDE)
     return "\n\n".join(parts)

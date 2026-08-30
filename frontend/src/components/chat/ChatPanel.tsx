@@ -7,7 +7,8 @@ import { ChatMessage } from "@/components/chat/ChatMessage";
 import { useAppStore } from "@/lib/store";
 
 export function ChatPanel() {
-  const { messages, sendMessage, isStreaming, tokenStats } = useAppStore();
+  const { messages, sendMessage, isStreaming, tokenStats, exportSessionLog } =
+    useAppStore();
   const endRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -23,8 +24,18 @@ export function ChatPanel() {
           </p>
           <h2 className="text-lg font-semibold tracking-[-0.04em]">实时对话与检索轨迹</h2>
         </div>
-        <div className="mono text-sm text-[var(--color-ink-soft)]">
-          {tokenStats ? `${tokenStats.total_tokens} tokens` : "No metrics yet"}
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => void exportSessionLog()}
+            disabled={!messages.length}
+            className="rounded-full border border-[var(--color-line)] px-3 py-1.5 text-xs text-[var(--color-ink-soft)] transition hover:bg-white/60 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            导出日志
+          </button>
+          <div className="mono text-sm text-[var(--color-ink-soft)]">
+            {tokenStats ? `${tokenStats.total_tokens} tokens` : "No metrics yet"}
+          </div>
         </div>
       </div>
 
@@ -39,8 +50,8 @@ export function ChatPanel() {
                 一个本地、透明、文件驱动的 Agent 工作台
               </h3>
               <p className="mt-3 max-w-2xl text-[var(--color-ink-soft)]">
-                你可以直接提问，也可以在右侧编辑 Memory、Skills 和 Workspace
-                文件。所有系统提示、会话和工具执行都可以追踪。
+                你可以直接提问，也可以在右侧编辑 Skills 和 Workspace 文件。
+                长期记忆由记忆库按需检索注入。所有系统提示、会话和工具执行都可以追踪。
               </p>
             </div>
           )}

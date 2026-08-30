@@ -22,7 +22,7 @@ LLM_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     },
     "deepseek": {
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "base_url": "https://api.deepseek.com",
     },
     "openai": {
@@ -32,6 +32,10 @@ LLM_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
 }
 
 EMBEDDING_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
+    "local": {
+        "model": "BAAI/bge-small-zh-v1.5",
+        "base_url": "",
+    },
     "zhipu": {
         "model": "embedding-3",
         "base_url": "https://open.bigmodel.cn/api/paas/v4/",
@@ -70,8 +74,13 @@ class Settings:
     embedding_model: str
     embedding_api_key: str | None
     embedding_base_url: str
+    skill_embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    skill_route_threshold: float = 0.30
     component_char_limit: int = 20_000
     terminal_timeout_seconds: int = 30
+    database_url: str | None = None
+    memory_embedding_dimension: int = 512
+    memory_default_user_id: str = "default"
 
 
 def _load_env_file() -> Path:
@@ -168,6 +177,8 @@ def _resolve_llm_base_url(provider: str) -> str:
 
 
 def _resolve_embedding_api_key(provider: str) -> str | None:
+    if provider == "local":
+        return None
     if provider == "zhipu":
         return _first_api_key("EMBEDDING_API_KEY", "ZHIPU_API_KEY", "ZHIPUAI_API_KEY")
     if provider == "bailian":
@@ -176,6 +187,11 @@ def _resolve_embedding_api_key(provider: str) -> str | None:
 
 
 def _resolve_embedding_model(provider: str) -> str:
+    if provider == "local":
+        return (
+            _first_config_value("EMBEDDING_MODEL", "SKILL_EMBEDDING_MODEL")
+            or EMBEDDING_PROVIDER_DEFAULTS["local"]["model"]
+        )
     if provider == "zhipu":
         return (
             _first_config_value("EMBEDDING_MODEL", "ZHIPU_EMBEDDING_MODEL", "ZHIPU_MODEL")
@@ -190,6 +206,8 @@ def _resolve_embedding_model(provider: str) -> str:
 
 
 def _resolve_embedding_base_url(provider: str) -> str:
+    if provider == "local":
+        return ""
     if provider == "zhipu":
         return (
             _first_config_value("EMBEDDING_BASE_URL", "ZHIPU_EMBEDDING_BASE_URL", "ZHIPU_BASE_URL")
@@ -206,6 +224,39 @@ def _resolve_embedding_base_url(provider: str) -> str:
     )
 
 
+def _resolve_skill_embedding_model() -> str:
+    return _first_config_value("SKILL_EMBEDDING_MODEL") or "BAAI/bge-small-zh-v1.5"
+
+
+def _resolve_skill_route_threshold() -> float:
+    raw = _first_config_value("SKILL_ROUTE_THRESHOLD")
+    if raw is None:
+        return 0.30
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.30
+
+
+def _resolve_database_url() -> str | None:
+    value = _first_config_value("DATABASE_URL")
+    return value or None
+
+
+def _resolve_memory_embedding_dimension() -> int:
+    raw = _first_config_value("MEMORY_EMBEDDING_DIMENSION", "EMBEDDING_DIMENSION")
+    if raw is None:
+        return 512
+    try:
+        return int(raw)
+    except ValueError:
+        return 512
+
+
+def _resolve_memory_default_user_id() -> str:
+    return _first_config_value("MEMORY_DEFAULT_USER_ID") or "default"
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     backend_dir = _load_env_file()
@@ -213,12 +264,12 @@ def get_settings() -> Settings:
 
     llm_provider = _normalize_provider(
         _first_config_value("LLM_PROVIDER"),
-        default="zhipu",
+        default="deepseek",
         defaults=LLM_PROVIDER_DEFAULTS,
     )
     embedding_provider = _normalize_provider(
         _first_config_value("EMBEDDING_PROVIDER"),
-        default="bailian",
+        default="local",
         defaults=EMBEDDING_PROVIDER_DEFAULTS,
     )
 
@@ -233,6 +284,11 @@ def get_settings() -> Settings:
         embedding_model=_resolve_embedding_model(embedding_provider),
         embedding_api_key=_resolve_embedding_api_key(embedding_provider),
         embedding_base_url=_resolve_embedding_base_url(embedding_provider),
+        skill_embedding_model=_resolve_skill_embedding_model(),
+        skill_route_threshold=_resolve_skill_route_threshold(),
+        database_url=_resolve_database_url(),
+        memory_embedding_dimension=_resolve_memory_embedding_dimension(),
+        memory_default_user_id=_resolve_memory_default_user_id(),
     )
 
 
@@ -240,7 +296,7 @@ class RuntimeConfigManager:
     def __init__(self, config_path: Path) -> None:
         self._config_path = config_path
         self._lock = threading.Lock()
-        self._default_config = {"rag_mode": False}
+        self._default_config = {"rag_mode": False, "memory_mode": False}
 
     def load(self) -> dict[str, Any]:
         with self._lock:
@@ -254,6 +310,11 @@ class RuntimeConfigManager:
 
     def save(self, payload: dict[str, Any]) -> dict[str, Any]:
         merged = dict(self._default_config)
+        if self._config_path.exists():
+            try:
+                merged.update(json.loads(self._config_path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                pass
         merged.update(payload)
         self._config_path.write_text(
             json.dumps(merged, ensure_ascii=False, indent=2),
@@ -266,6 +327,12 @@ class RuntimeConfigManager:
 
     def set_rag_mode(self, enabled: bool) -> dict[str, Any]:
         return self.save({"rag_mode": enabled})
+
+    def get_memory_mode(self) -> bool:
+        return bool(self.load().get("memory_mode", False))
+
+    def set_memory_mode(self, enabled: bool) -> dict[str, Any]:
+        return self.save({"memory_mode": enabled})
 
 
 runtime_config = RuntimeConfigManager(get_settings().backend_dir / "config.json")

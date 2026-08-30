@@ -633,12 +633,17 @@ def build_ragas_evaluator_llm(agent_manager: Any):
 
 def build_ragas_embeddings():
     from config import get_settings
-    from langchain_openai import OpenAIEmbeddings
     from ragas.embeddings import LangchainEmbeddingsWrapper
 
     settings = get_settings()
+    if settings.embedding_provider == "local":
+        from knowledge_retrieval.embeddings import LocalLangchainEmbeddings
+
+        return LangchainEmbeddingsWrapper(LocalLangchainEmbeddings())
     if not settings.embedding_api_key:
         return None
+
+    from langchain_openai import OpenAIEmbeddings
 
     embeddings = OpenAIEmbeddings(
         model=settings.embedding_model,
