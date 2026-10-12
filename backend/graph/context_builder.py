@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from config import get_settings
 from graph.prompt_builder import build_system_prompt
@@ -9,15 +8,18 @@ from graph.skill_loader import LoadedSkill
 
 
 class AgentContextBuilder:
-    """组装 Main Agent 的 SystemMessage 结构化小节（方案第六、十一节）。
+    """组装 Main Agent 的 SystemMessage（方案第六、十一节）。
 
-    SystemMessage
+    SystemMessage 里**只允许放跨请求恒定不变的内容**，顺序固定：
+
     ├── Agent Role
     ├── Current Skill
     ├── SKILL.md Instructions
-    ├── Current Task State
-    ├── Current Plan（预留）
-    └── Relevant Conversation Context
+
+    为什么这么严格：上下文缓存按前缀精确匹配，system 排在请求最前面，
+    只要里面有一个字每轮变化，它后面的整段对话历史都会一起失效。
+    所以任务目标、计划、记忆召回、对话摘要这类动态内容一律不进 system，
+    改由 agent.py 拼进"当轮 user 消息"，永远只追加在末尾。
     """
 
     def __init__(self, base_dir: Path) -> None:
@@ -39,33 +41,6 @@ class AgentContextBuilder:
         )
 
     @staticmethod
-    def build_task_state_section(task_context: dict[str, Any] | None) -> str:
-        if not task_context:
-            return ""
-        lines = ["## Current Task State"]
-        goal = str(task_context.get("goal", "")).strip()
-        if goal:
-            lines.append(f"\n目标：\n{goal}")
-        for label, key in (
-            ("已完成：", "completed"),
-            ("主要发现：", "findings"),
-            ("当前缺少：", "missing"),
-        ):
-            values = task_context.get(key) or []
-            if values:
-                lines.append(f"\n{label}")
-                lines.extend(f"- {value}" for value in values)
-        return "\n".join(lines)
-
-    @staticmethod
-    def build_plan_section(plan: list[str] | None) -> str:
-        if not plan:
-            return ""
-        lines = ["## Current Plan"]
-        lines.extend(f"- {item}" for item in plan)
-        return "\n".join(lines)
-
-    @staticmethod
     def build_conversation_context_section(conversation_context: str) -> str:
         if not conversation_context:
             return ""
@@ -75,26 +50,12 @@ class AgentContextBuilder:
             "仅在与当前任务相关时使用。"
         )
 
-    def build_system_message_content(
-        self,
-        skill: LoadedSkill | None,
-        task_context: dict[str, Any] | None,
-        plan: list[str] | None,
-        conversation_context: str,
-    ) -> str:
+    def build_system_content(self, skill: LoadedSkill | None) -> str:
+        """静态 system prompt：同一 skill 下必须逐字节一致。"""
         parts: list[str] = [self.build_agent_role()]
         skill_section = self.build_skill_section(skill)
         if skill_section:
             parts.append(skill_section)
-        task_section = self.build_task_state_section(task_context)
-        if task_section:
-            parts.append(task_section)
-        plan_section = self.build_plan_section(plan)
-        if plan_section:
-            parts.append(plan_section)
-        conversation_section = self.build_conversation_context_section(conversation_context)
-        if conversation_section:
-            parts.append(conversation_section)
 
         settings = get_settings()
         content = "\n\n".join(parts)

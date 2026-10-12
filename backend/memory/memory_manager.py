@@ -102,7 +102,7 @@ class MemoryManager:
             return batch(texts)
         return [self._embed_model.get_text_embedding(text) for text in texts]
 
-    async def add_memory(
+    def add_memory_sync(
         self,
         user_id: str,
         content: str,
@@ -110,6 +110,7 @@ class MemoryManager:
         importance: float = 0.5,
         status: str = "active",
     ) -> MemoryRecord | None:
+        """同步写入一条长期记忆（供工具等非 async 上下文调用）。"""
         content = (content or "").strip()
         if not content:
             raise ValueError("content 不能为空")
@@ -121,9 +122,8 @@ class MemoryManager:
             logger.warning("长期记忆未就绪，忽略 add_memory 调用")
             return None
         try:
-            embeddings = await asyncio.to_thread(self._embed, [content])
-            row = await asyncio.to_thread(
-                self._repository.insert,
+            embeddings = self._embed([content])
+            row = self._repository.insert(
                 user_id,
                 type,
                 content,
@@ -136,16 +136,37 @@ class MemoryManager:
             return None
         return MemoryRecord(**row)
 
+    async def add_memory(
+        self,
+        user_id: str,
+        content: str,
+        type: str = "episodic",
+        importance: float = 0.5,
+        status: str = "active",
+    ) -> MemoryRecord | None:
+        return await asyncio.to_thread(
+            self.add_memory_sync,
+            user_id,
+            content,
+            type,
+            importance,
+            status,
+        )
+
     async def retrieve_memories(
         self,
         user_id: str,
         query: str,
         top_k: int = 5,
         types: list[str] | None = None,
+        min_score: float | None = None,
     ) -> list[MemoryRecord]:
         query = (query or "").strip()
         if not self.is_available or not query:
             return []
+        threshold = (
+            get_settings().memory_retrieval_min_score if min_score is None else min_score
+        )
         try:
             embeddings = await asyncio.to_thread(self._embed, [query])
             rows = await asyncio.to_thread(
@@ -158,7 +179,25 @@ class MemoryManager:
         except Exception:
             logger.exception("retrieve_memories 失败")
             return []
-        return [MemoryRecord(**row) for row in rows]
+        records = [MemoryRecord(**row) for row in rows]
+
+        # 回传门限：search 已按相似度降序取 top_k，因此对结果做后置过滤
+        # 与"先过滤再取 top_k"等价（top_k 之外的结果分数只会更低）。
+        if threshold is None or threshold <= 0:
+            return records
+        kept = [
+            record
+            for record in records
+            if record.score is None or float(record.score) >= threshold
+        ]
+        if len(kept) != len(records):
+            logger.info(
+                "[Memory] 相关度门限 %.2f：召回 %d 条，回传 %d 条",
+                threshold,
+                len(records),
+                len(kept),
+            )
+        return kept
 
     async def get_memory(self, memory_id: str) -> MemoryRecord | None:
         if not self.is_available:
@@ -216,18 +255,6 @@ class MemoryManager:
             )
         except Exception:
             logger.exception("update_memory 失败")
-            return None
-        return MemoryRecord(**row) if row else None
-
-    async def deactivate_memory(self, memory_id: str) -> MemoryRecord | None:
-        if not self.is_available:
-            return None
-        try:
-            row = await asyncio.to_thread(
-                self._repository.set_status, memory_id, "inactive"
-            )
-        except Exception:
-            logger.exception("deactivate_memory 失败")
             return None
         return MemoryRecord(**row) if row else None
 

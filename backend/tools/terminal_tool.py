@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
 import subprocess
 from pathlib import Path
@@ -51,22 +52,34 @@ class TerminalTool(BaseTool):
             return "Blocked: command matches the terminal blacklist."
 
         settings = get_settings()
-        shell_command = (
-            ["powershell", "-NoProfile", "-Command", command]
-            if platform.system().lower().startswith("win")
-            else ["bash", "-lc", command]
-        )
+        # 子进程按 UTF-8 输出，避免 Windows 默认 GBK 造成的乱码/解码失败
+        environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        if platform.system().lower().startswith("win"):
+            # PowerShell 会把子进程输出按控制台编码重新编码，这里显式切成 UTF-8
+            wrapped = (
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+                "$OutputEncoding=[System.Text.Encoding]::UTF8;"
+                f"{command}"
+            )
+            shell_command = ["powershell", "-NoProfile", "-Command", wrapped]
+        else:
+            shell_command = ["bash", "-lc", command]
         try:
             completed = subprocess.run(
                 shell_command,
                 cwd=self._root_dir,
                 capture_output=True,
                 text=True,
+                # Windows 默认用系统本地编码（GBK）解码子进程输出，
+                # 一旦命令输出 UTF-8 中文就会抛 UnicodeDecodeError 并丢失输出
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
                 timeout=settings.terminal_timeout_seconds,
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return "Timed out after 30 seconds."
+            return f"Timed out after {settings.terminal_timeout_seconds} seconds."
 
         combined = (completed.stdout or "") + (completed.stderr or "")
         combined = combined.strip() or "[no output]"

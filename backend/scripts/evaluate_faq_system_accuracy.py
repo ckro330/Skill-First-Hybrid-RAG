@@ -11,6 +11,15 @@ from pathlib import Path
 from typing import Any
 
 
+# ragas 硬导入 langchain_community.chat_models.vertexai，而 langchain-community 0.4.x
+# 已移除该模块；不先打桩的话下面的 ragas 导入会被 except ImportError 静默跳过。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import _ragas_compat  # noqa: F401
+except ImportError:
+    pass
+
+
 DEFAULT_FAQ_PATH = Path(r"E:\download\ragclaw\ragclaw\backend\knowledge\E-commerce Data\faq.json")
 DEFAULT_PREFIX = "请帮我在知识库查询并回答："
 DEFAULT_OUTPUT_PATH = Path("storage") / "eval_outputs" / "faq_system_accuracy_results.json"

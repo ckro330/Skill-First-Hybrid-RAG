@@ -1,0 +1,38 @@
+%% 代码助手多 Agent 架构（Planner 领域分流 + LangGraph 父子编排）
+%% 与 docs/architecture-multi-agent.png 一致；Skill / Tool 以 backend/agents/registry.py 为准
+flowchart TB
+    U["用户请求（前端 Chat）"] --> M["AgentManager.astream()<br/>SSE 流式入口"]
+    M --> MEM["长期记忆检索 memory_manager<br/>min_score=0.55 · top_k=3"]
+    MEM --> P["Planner（外层）<br/>领域判定 + 任务拆解<br/>PlanDecision{domain, multi_agent, tasks}"]
+
+    P -->|rag| RAG["RAG 领域（知识库）<br/>knowledge_orchestrator + rag-skill"]
+    P -->|general| GEN["通用闲聊<br/>直连 LLM 作答"]
+    P -->|coding| SUP
+
+    subgraph TEAM["LangGraph StateGraph(TeamState) · 父子图"]
+        direction TB
+        SUP["supervisor · 父 agent（planner）<br/>order_tasks 拓扑排序 · 依赖满足即派发"]
+        SUP -->|route_after_supervisor| A1["log-analysis-agent<br/>Skill: log-analysis"]
+        SUP -->|route_after_supervisor| A2["code-modify-agent<br/>Skill: code-modification"]
+        SUP -->|route_after_supervisor| A3["test-agent<br/>Skill: test-execution, test-authoring"]
+        SUP -->|route_after_supervisor| A4["git-agent<br/>Skill: git-management"]
+
+        BUS["A2A 消息总线<br/>planner ←→ 子 agent（task / result）· 每次请求独立新建"]
+        A1 <-.-> BUS
+        A2 <-.-> BUS
+        A3 <-.-> BUS
+        A4 <-.-> BUS
+
+        A1 -.->|完成后回到 supervisor| SUP
+        A2 -.->|完成后回到 supervisor| SUP
+        A3 -.->|完成后回到 supervisor| SUP
+        A4 -.->|完成后回到 supervisor| SUP
+
+        SUP -->|待办清空| AGG["aggregate · 父 agent 收尾<br/>单任务直返 / 多任务 LLM 汇总 / 失败项如实保留"]
+        AGG --> FIN["最终答复<br/>a2a_transcript + done → SSE"]
+    end
+
+    A1 --> REACT["子 agent 内部：ReAct 子图 model ←→ tools（max_steps 限制）"]
+    A2 --> REACT
+    A3 --> REACT
+    A4 --> REACT

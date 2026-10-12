@@ -92,7 +92,8 @@ importance: 0.7
 
 - 用 `read_file` 读取当前技能；用 `GET /api/memories` 查询已有长期记忆
 - 用 `POST /api/memories` 写入长期记忆（数据库不可用时接口返回 503，说明记忆库未就绪）
-- 用 `python_repl` 或 `terminal` 进行受控文件修改
+- 用 `edit_file` 对当前技能做精确增补（`old_text` 逐字复制，保证唯一），新建经验文件用 `write_file`
+- 只有 `edit_file` / `write_file` 不适用的特殊场景，才退回 `python_repl` 或 `terminal` 做受控文件修改
 - 如果修改了技能的 frontmatter（name/description），记得刷新技能快照；如果只改正文，一般不需要
 
 ## 禁止事项

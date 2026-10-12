@@ -16,13 +16,18 @@
 - Prompt 可解释：系统提示词由多个 Markdown 文件实时组装
 - 技能可审计：每个技能都是 `skills/*/SKILL.md`
 - 检索可观测：前端会展示知识检索步骤、证据来源和工具调用
+- 编排可观测：Planner 的领域判定 / 任务拆解、下游 Agent 的 A2A 消息链都会推到前端
 
 ## 当前能力
 
 - FastAPI + SSE 流式聊天
 - 会话持久化到 `backend/sessions/*.json`
 - 长期记忆：PostgreSQL + pgvector（`MemoryManager` 统一入口）
-- 可切换的记忆检索（memory 开关）与知识库 RAG（rag 开关）
+- 记忆自主召回：每轮对话前自动检索长期记忆，对话结束后按 importance 自主决定是否入库，无需开关
+- Planner 自动分流：一次 LLM 调用同时完成领域判定（coding / rag / general）与编码任务拆解
+- 代码助手多 Agent 编排：LangGraph 父子图 + supervisor / aggregate + A2A 消息总线，子任务支持依赖排序与并行派发
+- 代码助手工具链：读写文件、grep、日志检索 / 统计、运行测试、git 状态 / 差异 / 历史 / 暂存 / 提交 / 分支
+- 知识库 RAG 由 Planner 自动分流：判定为知识库领域时自动进入检索链路，无需开关
 - 本地知识库检索
 - 前端三栏工作台
 - 在线编辑 Skills / Workspace 文件
@@ -31,9 +36,53 @@
 当前内置技能包括：
 
 - `rag-skill`：本地知识库检索
+- `coding-skill`：代码开发（阅读/分析代码、定位 Bug、修改代码、运行测试与验证）
+- `code-modification`：面向仓库的精确代码修改（先读懂上下文，再最小改动、自检、复查差异）
+- `log-analysis`：日志过滤、错误分布统计、报错时间线与根因定位
+- `test-execution`：运行既有测试、复现问题、验证改动与回归
+- `test-authoring`：按项目现有框架与风格补写单元 / 回归测试
+- `git-management`：仓库状态 / 差异 / 历史 / 分支，暂存与提交（只提交不推送）
 - `web-search`：联网搜索
 - `get_weather`：天气查询
 - `retry-lesson-capture`：失败经验沉淀
+
+## 代码助手多 Agent 编排
+
+当 Planner 判定领域为 `coding` 时，请求会进入代码助手多 Agent 链路：
+
+```mermaid
+flowchart TB
+    U["用户请求"] --> M["AgentManager.astream()（SSE）"]
+    M --> MEM["长期记忆检索"] --> P{"Planner：领域判定 + 任务拆解"}
+    P -- "rag" --> RAG["知识库链路：knowledge_orchestrator + rag-skill"]
+    P -- "general" --> GEN["通用问答：直连 LLM"]
+    P -- "coding" --> SUP["supervisor（父 agent）"]
+    SUP --> A1["log-analysis-agent"]
+    SUP --> A2["code-modify-agent"]
+    SUP --> A3["test-agent"]
+    SUP --> A4["git-agent"]
+    A1 --> SUP
+    A2 --> SUP
+    A3 --> SUP
+    A4 --> SUP
+    SUP -- "待办清空" --> AGG["aggregate：汇总子任务结果"]
+    AGG --> O["最终答复（含 a2a_transcript）"]
+```
+
+- Planner 用一次 LLM 调用同时完成领域判定与任务拆解，输出 `{domain, reason, tasks[], depends_on}`
+- 父图（`supervisor`）按依赖做稳定拓扑排序，依赖满足即并行 fan-out 到下游 Agent
+- 下游 Agent 各自绑定一个 Skill 与工具白名单，内部复用现有 ReAct 子图执行，完成后回到 `supervisor` 继续派发
+- Planner 与下游 Agent 之间通过进程内 A2A 消息总线（`task` / `result`）通信，总线每次请求独立新建
+- 所有子任务跑完后由 `aggregate` 汇总：单任务直返、多任务由 LLM 汇总，失败项如实保留
+
+相关代码位置：
+
+- Planner：[backend/agents/planner.py](backend/agents/planner.py)
+- 下游 Agent 与工具白名单：[backend/agents/registry.py](backend/agents/registry.py)
+- LangGraph 父子图：[backend/agents/team_graph.py](backend/agents/team_graph.py)
+- 子任务执行器：[backend/agents/executor.py](backend/agents/executor.py)
+- A2A 消息总线：[backend/agents/a2a.py](backend/agents/a2a.py)
+- 架构图：[docs/architecture-multi-agent.png](docs/architecture-multi-agent.png) / [docs/langgraph-team-graph.png](docs/langgraph-team-graph.png)
 
 ## 知识库目录说明
 
@@ -101,6 +150,7 @@ ragclaw/
 ├─ backend/
 │  ├─ api/                    # Chat、session、file、token、knowledge index 接口
 │  ├─ graph/                  # Agent、prompt、session、memory 相关逻辑
+│  ├─ agents/                 # 代码助手多 Agent：planner / registry / executor / team_graph / A2A 消息总线
 │  ├─ knowledge/              # 仓库内置示例知识库
 │  ├─ knowledge_retrieval/    # Skill 优先 + hybrid fallback 检索链路
 │  ├─ memory/                 # 长期记忆：MemoryManager + pgvector Repository
@@ -108,13 +158,14 @@ ragclaw/
 │  ├─ sessions/               # 会话历史
 │  ├─ skills/                 # 技能目录，每个技能核心是 SKILL.md
 │  ├─ storage/                # 索引、评测产物等缓存
-│  ├─ tools/                  # terminal / read_file / python_repl / fetch_url
+│  ├─ tools/                  # terminal / read_file / write_file / edit_file / grep / log_* / run_tests / git_* / python_repl / fetch_url
 │  ├─ workspace/              # SOUL / USER / AGENTS 等系统上下文组件
 │  └─ app.py                  # FastAPI 入口
 ├─ frontend/
 │  ├─ src/app/                # 页面入口
 │  ├─ src/components/         # 聊天面板、检索面板、编辑器等 UI
 │  └─ src/lib/                # API 客户端与状态管理
+├─ docs/                     # 架构图与工程实践笔记
 └─ README.md
 ```
 
@@ -126,6 +177,7 @@ ragclaw/
 - FastAPI
 - Uvicorn
 - LangChain 1.x
+- LangGraph（多 Agent 父子图编排）
 - LlamaIndex
 - PostgreSQL + pgvector（长期记忆）
 - OpenAI-compatible model API
@@ -181,6 +233,12 @@ EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 TAVILY_API_KEY=your_key
 ```
 
+可选调参（写入 `backend/.env` 或系统环境变量）：
+
+- `MEMORY_IMPORTANCE_THRESHOLD`：对话结束后记忆入库的重要度门限，默认 `0.7`
+- `MEMORY_RETRIEVAL_MIN_SCORE`：长期记忆召回的最低余弦相似度，默认 `0.55`
+- `SKILL_ROUTE_THRESHOLD`：Skill 路由 L2 的判定阈值，默认 `0.30`
+
 ## 快速开始
 
 ### 1. 启动后端
@@ -230,7 +288,7 @@ $env:NEXT_PUBLIC_API_BASE_URL="http://127.0.0.1:8010/api"
 
 1. 启动前后端，发送一条普通聊天消息，确认流式输出正常
 2. 打开右侧 Inspector，查看工具调用和 Raw Messages
-3. 打开记忆开关，观察 Memory 检索步骤是否注入 Agent 上下文
+3. 直接提问，观察 Memory 检索步骤是否自动注入 Agent 上下文
 4. 提一个知识库问题，观察 Skill 检索和 fallback 检索是否出现
 5. 查看 `backend/sessions/*.json`，确认消息、工具和检索记录已落盘
 
@@ -241,22 +299,24 @@ $env:NEXT_PUBLIC_API_BASE_URL="http://127.0.0.1:8010/api"
 - `GET /api/sessions`
 - `GET /api/files`
 - `POST /api/files`
-- `GET /api/config/rag-mode`
-- `PUT /api/config/rag-mode`
 - `GET /api/knowledge/index/status`
 - `POST /api/knowledge/index/rebuild`
 
 ## 评测脚本
 
-仓库内已经包含 FAQ 检索评测相关脚本，产物会写入：
+仓库内已经包含检索与评测相关脚本，产物写入 `backend/storage/eval_outputs/`。
 
-- `backend/storage/eval_outputs/`
+- `scripts/build_rag_eval_dataset.py`：构建 RAG 评测数据集
+- `scripts/ragas_offline_eval.py`：Ragas 离线评测（上下文召回率、忠实度等）
+- `scripts/evaluate_faq_agent_retrieval.py` / `scripts/evaluate_faq_system_accuracy.py`：FAQ 检索与系统准确率评测
+- `scripts/measure_planner_cache.py`：测量 Planner 规划链路的缓存命中率与 token 成本
 
 适合做：
 
 - 路由命中率评测
 - FAQ 检索准确率评测
 - Ragas 指标评测
+- Planner 缓存命中率评测
 
 ## 当前边界
 
@@ -264,6 +324,7 @@ $env:NEXT_PUBLIC_API_BASE_URL="http://127.0.0.1:8010/api"
 - Excel / PDF 的高级处理仍主要依赖技能链路
 - 混合检索当前主要覆盖 Markdown / JSON 类知识文件
 - 技能和知识链路仍在快速迭代中
+- 代码助手 Agent 默认只做本地读写、测试与提交，不执行 push 等推送操作
 
 ## 致谢
 

@@ -17,6 +17,7 @@ backend/storage/memory_index/*
 backend/storage/knowledge/*
 !backend/storage/knowledge/.gitkeep
 frontend/.next/
+*.tsbuildinfo
 frontend/node_modules/
 frontend/.npm-cache/
 .vscode/
@@ -27,3 +28,4 @@ AGENTS.md
 backend/temp_*.txt
 .DS_Store
 Thumbs.db
+backend/storage/eval_outputs/

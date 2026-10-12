@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
-import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -81,6 +78,8 @@ class Settings:
     database_url: str | None = None
     memory_embedding_dimension: int = 512
     memory_default_user_id: str = "default"
+    memory_importance_threshold: float = 0.7
+    memory_retrieval_min_score: float = 0.55
 
 
 def _load_env_file() -> Path:
@@ -257,6 +256,27 @@ def _resolve_memory_default_user_id() -> str:
     return _first_config_value("MEMORY_DEFAULT_USER_ID") or "default"
 
 
+def _resolve_memory_importance_threshold() -> float:
+    raw = _first_config_value("MEMORY_IMPORTANCE_THRESHOLD")
+    if raw is None:
+        return 0.7
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return 0.7
+
+
+def _resolve_memory_retrieval_min_score() -> float:
+    """长期记忆回传的相关度门限：低于该余弦相似度的召回结果不回传给 Agent。"""
+    raw = _first_config_value("MEMORY_RETRIEVAL_MIN_SCORE")
+    if raw is None:
+        return 0.55
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return 0.55
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     backend_dir = _load_env_file()
@@ -289,50 +309,6 @@ def get_settings() -> Settings:
         database_url=_resolve_database_url(),
         memory_embedding_dimension=_resolve_memory_embedding_dimension(),
         memory_default_user_id=_resolve_memory_default_user_id(),
+        memory_importance_threshold=_resolve_memory_importance_threshold(),
+        memory_retrieval_min_score=_resolve_memory_retrieval_min_score(),
     )
-
-
-class RuntimeConfigManager:
-    def __init__(self, config_path: Path) -> None:
-        self._config_path = config_path
-        self._lock = threading.Lock()
-        self._default_config = {"rag_mode": False, "memory_mode": False}
-
-    def load(self) -> dict[str, Any]:
-        with self._lock:
-            if not self._config_path.exists():
-                self.save(self._default_config)
-            try:
-                return json.loads(self._config_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                self.save(self._default_config)
-                return dict(self._default_config)
-
-    def save(self, payload: dict[str, Any]) -> dict[str, Any]:
-        merged = dict(self._default_config)
-        if self._config_path.exists():
-            try:
-                merged.update(json.loads(self._config_path.read_text(encoding="utf-8")))
-            except json.JSONDecodeError:
-                pass
-        merged.update(payload)
-        self._config_path.write_text(
-            json.dumps(merged, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return merged
-
-    def get_rag_mode(self) -> bool:
-        return bool(self.load().get("rag_mode", False))
-
-    def set_rag_mode(self, enabled: bool) -> dict[str, Any]:
-        return self.save({"rag_mode": enabled})
-
-    def get_memory_mode(self) -> bool:
-        return bool(self.load().get("memory_mode", False))
-
-    def set_memory_mode(self, enabled: bool) -> dict[str, Any]:
-        return self.save({"memory_mode": enabled})
-
-
-runtime_config = RuntimeConfigManager(get_settings().backend_dir / "config.json")

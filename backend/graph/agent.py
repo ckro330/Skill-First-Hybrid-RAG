@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 try:
@@ -13,9 +14,13 @@ try:
 except ImportError:  # pragma: no cover - optional dependency at runtime
     ChatDeepSeek = None
 
-from config import get_settings, runtime_config
+from agents.executor import AgentExecutor
+from agents.orchestrator import CodingOrchestrator
+from agents.planner import DOMAIN_CODING, DOMAIN_GENERAL, DOMAIN_RAG, Planner, planner
+from config import get_settings
 from graph.agent_state import MAX_STEPS, STATUS_RUNNING
 from graph.context_builder import AgentContextBuilder
+from graph.llm_usage import usage_collector
 from graph.prompt_builder import build_system_prompt
 from graph.react_agent import build_react_agent
 from graph.session_manager import SessionManager
@@ -24,9 +29,11 @@ from graph.skill_router import RouteDecision, skill_router
 from graph.skill_tool_registry import SkillToolRegistry
 from knowledge_retrieval import knowledge_orchestrator
 from memory.memory_manager import MemoryManager, MemoryRecord
+from memory.repository import MEMORY_TYPES
 from tools import get_all_tools
 
 KNOWLEDGE_SKILL_ID = "rag-skill"
+MEMORY_IMPORTANCE_THRESHOLD = 0.7
 logger = logging.getLogger("react_agent")
 
 
@@ -43,6 +50,43 @@ def _stringify_content(content: Any) -> str:
     return str(content or "")
 
 
+def _parse_memory_analysis(text: str) -> dict[str, Any]:
+    """解析记忆分析模型的 JSON 输出，失败时返回全 0 默认值。"""
+    default: dict[str, Any] = {"importance": 0.0, "type": "preference", "content": ""}
+    try:
+        cleaned = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip().strip("`")
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            cleaned = cleaned[start : end + 1]
+        data = json.loads(cleaned)
+    except Exception:
+        match = re.search(r"\"importance\"\s*:\s*([0-9.]+)", text)
+        if not match:
+            return default
+        data = {"importance": float(match.group(1))}
+
+    importance = max(0.0, min(1.0, float(data.get("importance") or 0)))
+    type_ = str(data.get("type") or "preference")
+    if type_ not in MEMORY_TYPES:
+        type_ = "preference"
+    content = str(data.get("content") or "").strip()
+    return {"importance": importance, "type": type_, "content": content}
+
+
+def _history_contains(history: list[dict[str, Any]], text: str) -> bool:
+    """history 里是否已经包含这段文本。
+
+    load_session_for_agent 会把压缩摘要并入首条 assistant 消息，
+    而对话接口又会单独传一次 compressed_context；不去重的话同一段摘要
+    会占两份 prompt（纯浪费 token）。
+    """
+    needle = (text or "").strip()
+    if not needle:
+        return False
+    return any(needle in str(item.get("content", "") or "") for item in history)
+
+
 class AgentManager:
     def __init__(self) -> None:
         self.base_dir: Path | None = None
@@ -52,6 +96,9 @@ class AgentManager:
         self.skill_tool_registry: SkillToolRegistry | None = None
         self.context_builder: AgentContextBuilder | None = None
         self.memory_manager: MemoryManager | None = None
+        self.planner: Planner | None = None
+        self.agent_executor: AgentExecutor | None = None
+        self.coding_orchestrator: CodingOrchestrator | None = None
 
     def initialize(self, base_dir: Path) -> None:
         self.base_dir = base_dir
@@ -64,10 +111,26 @@ class AgentManager:
         self.memory_manager.initialize()
         knowledge_orchestrator.configure(base_dir, self._build_chat_model)
         skill_router.configure(base_dir, self._build_chat_model)
+        planner.configure(base_dir, self._build_chat_model)
+        self.planner = planner
+        self.agent_executor = AgentExecutor(
+            base_dir,
+            self._build_chat_model,
+            self.skill_loader,
+            self.skill_tool_registry,
+        )
+        # A2A 总线由 orchestrator 每次请求内部新建，避免跨会话消息互相污染
+        self.coding_orchestrator = CodingOrchestrator(
+            base_dir,
+            self._build_chat_model,
+            self.agent_executor,
+        )
 
 #配置对话模型，没有配置好deepseek的时候替换
-    def _build_chat_model(self):
+    def _build_chat_model(self, callbacks: list[Any] | None = None):
         settings = get_settings()
+        # 所有 LLM 调用都经由这里构造，因此把用量采集统一挂在这一处
+        handlers: list[Any] = [usage_collector, *(callbacks or [])]
 
         if settings.llm_provider == "deepseek":
             if ChatDeepSeek is None:
@@ -79,6 +142,7 @@ class AgentManager:
                 api_key=settings.llm_api_key,
                 base_url=settings.llm_base_url,
                 temperature=0,
+                callbacks=handlers,
             )
 
         if not settings.llm_api_key:
@@ -89,6 +153,7 @@ class AgentManager:
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             temperature=0,
+            callbacks=handlers,
         )
     
 #构建上下文
@@ -113,7 +178,7 @@ class AgentManager:
 #整理检索结果，以便后续产出
     def _format_memory_retrieval_step(self, results: list[MemoryRecord]) -> dict[str, Any]:
         return {
-            "kind": "memory",
+            "kind": "memory",   
             "stage": "memory",
             "title": f"Memory 检索到 {len(results)} 条记忆",
             "message": "已将 Memory 召回结果注入当前请求上下文。",
@@ -137,30 +202,66 @@ class AgentManager:
         history: list[dict[str, Any]],
         retrievals: list[MemoryRecord],
         compressed_context: str,
+        *,
+        include_recent_turns: bool = True,
         limit: int = 4000,
     ) -> str:
+        """组装当轮动态上下文（压缩摘要 + 记忆召回 + 可选的历史简略）。
+
+        include_recent_turns 只在"没有把真实历史交给模型"的链路上开启
+        （代码助手下游子 Agent）；主 Agent 已经把完整历史作为 messages 传入，
+        再塞一份"最近对话（简略）"既是重复，也会让前缀每轮变化。
+        """
         lines: list[str] = []
         if compressed_context:
             lines.append("[之前对话摘要]\n" + compressed_context.strip())
         if retrievals:
             lines.append(self._format_retrieval_context(retrievals))
 
-        recent = [
-            item for item in history[-6:] if item.get("role") in {"user", "assistant"}
-        ]
-        turns: list[str] = []
-        for item in recent:
-            role = "用户" if item.get("role") == "user" else "助手"
-            content = str(item.get("content", "") or "").strip().replace("\n", " ")[:200]
-            if content:
-                turns.append(f"- {role}: {content}")
-        if turns:
-            lines.append("[最近对话（简略）]\n" + "\n".join(turns))
+        if include_recent_turns:
+            recent = [
+                item for item in history[-6:] if item.get("role") in {"user", "assistant"}
+            ]
+            turns: list[str] = []
+            for item in recent:
+                role = "用户" if item.get("role") == "user" else "助手"
+                content = str(item.get("content", "") or "").strip().replace("\n", " ")[:200]
+                if content:
+                    turns.append(f"- {role}: {content}")
+            if turns:
+                lines.append("[最近对话（简略）]\n" + "\n".join(turns))
 
         context = "\n\n".join(lines)
         if len(context) > limit:
             return context[:limit] + "\n...[truncated]"
         return context
+
+#把历史转成 LangChain 消息，并把当轮动态上下文并进最后一条 user 消息
+    def _build_agent_messages(
+        self,
+        history: list[dict[str, Any]],
+        message: str,
+        turn_context: str,
+    ) -> list[Any]:
+        """历史只追加、不重写；动态内容只出现在末尾。
+
+        这样上一轮的请求才是这一轮请求的**前缀**，上下文缓存才可能命中。
+        反过来，只要把动态内容塞回 system，前缀从第一个 token 就断了。
+        """
+        messages: list[Any] = []
+        for item in self._build_messages(history):
+            if item["role"] == "user":
+                messages.append(HumanMessage(content=item["content"]))
+            else:
+                messages.append(AIMessage(content=item["content"]))
+
+        if turn_context.strip():
+            section = self.context_builder.build_conversation_context_section(turn_context)
+            content = f"{section}\n\n---\n\n{message}"
+        else:
+            content = message
+        messages.append(HumanMessage(content=content))
+        return messages
 
 #整理knowledge检索结果，判断是否检索成功或者找到检索状态
     def _format_knowledge_context(self, retrieval_result) -> str:
@@ -181,8 +282,14 @@ class AgentManager:
         return "\n\n".join(lines)
 
 #构造进行knowledge检索的提示词
-    def _knowledge_answer_instructions(self, retrieval_result) -> list[str]:
-        instructions = [
+    @staticmethod
+    def _knowledge_answer_instructions() -> list[str]:
+        """这些指令是常量：一旦掺入每次检索都不同的内容，system 前缀就失效了。
+
+        检索状态与原因已经在 evidence 区块里（_format_knowledge_context），
+        不需要再重复一遍。
+        """
+        return [
             "This is a knowledge-base question.",
             "Use only the provided knowledge retrieval evidence to answer.",
             "Do not perform additional knowledge-base inspection with tools.",
@@ -191,9 +298,6 @@ class AgentManager:
             "When evidence is insufficient, suggest narrowing the scope by directory, file, keyword, field name, or time range.",
             "Cite the file paths you relied on.",
         ]
-        if retrieval_result.reason:
-            instructions.append(f"Current retrieval note: {retrieval_result.reason}")
-        return instructions
 
 #异步流式的agent输出答案，和stream：true用法相似，这里调用大模型生成答案
 #这里的异步async负责异步输出多轮yield结果
@@ -233,16 +337,89 @@ class AgentManager:
         if self.base_dir is None:
             raise RuntimeError("AgentManager is not initialized")
 
+        # 压缩摘要已经并入 history（load_session_for_agent），这里避免再注入一遍
+        if _history_contains(history, compressed_context):
+            compressed_context = ""
+
+#长期记忆检索：每轮自主召回，不再依赖开关；coding / rag / general 三条链路都会用到，
+#因此必须放在 planner 分流之前。未配置或 PostgreSQL 不可用时自动降级为空。
+        retrievals: list[MemoryRecord] = []
+        augmented_history = list(history)
+        if self.memory_manager is not None and self.memory_manager.is_available:
+            retrievals = await self.memory_manager.retrieve_memories(
+                user_id=self.memory_manager.default_user_id,
+                query=message,
+                top_k=3,
+            )
+            if retrievals:
+                #这里是创建一个新字典，**负责把上面的检索结果字典展开成键值对，和前面的type一起组成一个新的字典
+                yield {"type": "retrieval", **self._format_memory_retrieval_step(retrievals)}
+                augmented_history.append(
+                    {
+                        "role": "assistant",
+                        "content": self._format_retrieval_context(retrievals),
+                    }
+                )
+
+#外层 Planner：判定领域（coding / rag / general），coding 时拆解并派发给下游 Agent
+        planner_decision = None
+        if self.planner is not None:
+            try:
+                planner_decision = await self.planner.decide(message, history)
+            except Exception:
+                logger.exception("[Planner] 决策异常，放行到默认链路")
+                planner_decision = None
+        if planner_decision is not None:
+            yield {
+                "type": "planner",
+                "domain": planner_decision.domain,
+                "reason": planner_decision.reason,
+                "stage": planner_decision.stage,
+                "multi_agent": planner_decision.multi_agent,
+                "tasks": [task.to_dict() for task in planner_decision.tasks],
+            }
+            if (
+                planner_decision.domain == DOMAIN_CODING
+                and self.coding_orchestrator is not None
+            ):
+                coding_context = self._build_conversation_context(
+                    history,
+                    retrievals,
+                    compressed_context,
+                )
+                async for event in self.coding_orchestrator.astream(
+                    message,
+                    planner_decision,
+                    conversation_context=coding_context,
+                ):
+                    yield event
+                return
+
 #Skill 路由决策：三层路由（L1 指令 / L2 混合检索 / L3 轻量 LLM）
-        try:
-            route_decision = await skill_router.route(message)
-        except Exception:
-            # 路由失败时放行到通用分支，主 Agent 仍可按快照自行读取技能
+        route_decision: RouteDecision | None = None
+        if planner_decision is not None and planner_decision.domain == DOMAIN_RAG:
+            route_decision = RouteDecision(
+                kind="skill",
+                skill_id=KNOWLEDGE_SKILL_ID,
+                stage="planner",
+                reason=f"Planner 判定为知识库领域：{planner_decision.reason}",
+            )
+        elif planner_decision is not None and planner_decision.domain == DOMAIN_GENERAL:
             route_decision = RouteDecision(
                 kind="none",
-                stage="fallback",
-                reason="路由调用失败，放行到通用分支。",
+                stage="planner",
+                reason=f"Planner 判定为通用问答：{planner_decision.reason}",
             )
+        if route_decision is None:
+            try:
+                route_decision = await skill_router.route(message)
+            except Exception:
+                # 路由失败时放行到通用分支，主 Agent 仍可按快照自行读取技能
+                route_decision = RouteDecision(
+                    kind="none",
+                    stage="fallback",
+                    reason="路由调用失败，放行到通用分支。",
+                )
         logger.info(
             "[SkillRouter] selected skill = %s (stage=%s, candidates=%s, reason=%s)",
             route_decision.skill_id or "NONE",
@@ -266,31 +443,6 @@ class AgentManager:
             return
 
         selected_skill = route_decision.skill_id or "NONE"
-
-#长期记忆检索（独立于 rag_mode，由 memory_mode 开关控制）
-        memory_mode = runtime_config.get_memory_mode()
-        retrievals: list[MemoryRecord] = []
-        augmented_history = list(history)
-        if (
-            memory_mode
-            and self.memory_manager is not None
-            and self.memory_manager.is_available
-        ):
-            retrievals = await self.memory_manager.retrieve_memories(
-                user_id=self.memory_manager.default_user_id,
-                query=message,
-                top_k=3,
-            )
-            if retrievals:
-                #这里是创建一个新字典，**负责把上面的检索结果字典展开成键值对，和前面的type一起组成一个新的字典
-                yield {"type": "retrieval", **self._format_memory_retrieval_step(retrievals)}
-            if retrievals:
-                augmented_history.append(
-                    {
-                        "role": "assistant",
-                        "content": self._format_retrieval_context(retrievals),
-                    }
-                )
 
 #知识库技能（rag-skill）：走 Skill 优先 + 混合检索兜底链路
         if selected_skill == KNOWLEDGE_SKILL_ID:
@@ -316,7 +468,7 @@ class AgentManager:
 
             async for event in self._astream_model_answer(
                 messages,
-                extra_instructions=self._knowledge_answer_instructions(knowledge_result) if knowledge_result else None,
+                extra_instructions=self._knowledge_answer_instructions() if knowledge_result else None,
             ):
                 yield event
             return
@@ -341,10 +493,12 @@ class AgentManager:
         tools = self.skill_tool_registry.get_tools_for_skill(
             loaded_skill.skill_id if loaded_skill is not None else None
         )
+        # 主 Agent 会把完整历史作为 messages 传给模型，这里不再重复"最近对话（简略）"
         conversation_context = self._build_conversation_context(
             history,
             retrievals,
             compressed_context,
+            include_recent_turns=False,
         )
         initial_task_context: dict[str, Any] = {
             "goal": message,
@@ -352,16 +506,11 @@ class AgentManager:
             "findings": [],
             "missing": [],
         }
+        # system 只放静态内容（角色 + 当前技能），保证同 skill 下逐字节恒定
+        system_content = self.context_builder.build_system_content(loaded_skill)
 
-        def system_message_builder(state: dict[str, Any]) -> str:
-            if self.context_builder is None:
-                raise RuntimeError("AgentManager is not initialized")
-            return self.context_builder.build_system_message_content(
-                loaded_skill,
-                state.get("task_context") or initial_task_context,
-                state.get("plan") or [],
-                state.get("conversation_context") or conversation_context,
-            )
+        def system_message_builder(_state: dict[str, Any]) -> str:
+            return system_content
 
         agent = build_react_agent(
             self._build_chat_model(),
@@ -369,7 +518,7 @@ class AgentManager:
             system_message_builder=system_message_builder,
             max_steps=MAX_STEPS,
         )
-        messages = [HumanMessage(content=message)]
+        messages = self._build_agent_messages(history, message, conversation_context)
         input_state = {
             "messages": messages,
             "current_skill": loaded_skill.skill_id if loaded_skill is not None else None,
@@ -504,6 +653,120 @@ class AgentManager:
             return summary[:500]
         except Exception:
             return transcript[:500]
+
+#记忆分析：判断本轮对话是否值得写入长期记忆
+    async def analyze_memory_candidate(
+        self,
+        user_message: str,
+        assistant_reply: str,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        prompt = (
+            "你是长期记忆分析师，根据 importance 标准判断下面这轮对话是否值得写入长期记忆。\n\n"
+            "importance 标准（0~1）：\n"
+            "- 0.9~1.0：用户明确要求记住的信息、身份/偏好声明、长期承诺\n"
+            "- 0.75~0.9：可复用的方法论、经验教训、跨任务有价值的偏好或事实\n"
+            "- 0.5~0.75：仅对当前任务有参考价值的细节\n"
+            "- 0.2~0.5：一次性事实、临时请求\n"
+            "- 0~0.2：寒暄、无关闲聊\n\n"
+            "只输出一个 JSON 对象，不要输出任何其他内容：\n"
+            '{"importance": <0~1的小数>, "type": "<profile|preference|project|episodic>", '
+            '"content": "<精炼后可复用的记忆文本；importance<=0.7 时 content 必须为空字符串>"}\n\n'
+            "对话内容：\n{transcript}"
+        )
+
+        lines: list[str] = []
+        for item in history[-10:]:
+            role = item.get("role", "assistant")
+            content = str(item.get("content", "") or "").strip()
+            if content:
+                lines.append(f"{role}: {content[:300]}")
+        lines.append(f"user: {str(user_message).strip()[:500]}")
+        lines.append(f"assistant: {str(assistant_reply).strip()[:800]}")
+        transcript = "\n".join(lines) or "（空对话）"
+
+        try:
+            response = await self._build_chat_model().ainvoke(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": transcript},
+                ]
+            )
+            text = _stringify_content(getattr(response, "content", ""))
+        except Exception:
+            logger.exception("[Memory] 记忆分析调用失败")
+            return {"importance": 0.0, "type": "preference", "content": ""}
+        return _parse_memory_analysis(text)
+
+    async def _store_memory_candidate(
+        self,
+        analysis: dict[str, Any],
+    ) -> MemoryRecord | None:
+        manager = self.memory_manager
+        if manager is None or not manager.is_available:
+            return None
+        # 轻量去重：与已有记忆正文完全一致，或存在包含关系时跳过
+        try:
+            existing = await manager.list_memories(
+                user_id=manager.default_user_id,
+                status="active",
+                limit=500,
+            )
+            normalized = analysis["content"].strip()
+            for record in existing:
+                existing_content = record.content.strip()
+                if (
+                    existing_content == normalized
+                    or (normalized and existing_content and normalized in existing_content)
+                    or (normalized and existing_content and existing_content in normalized)
+                ):
+                    return record
+        except Exception:
+            logger.exception("[Memory] 记忆去重查询失败")
+        return await manager.add_memory(
+            user_id=manager.default_user_id,
+            content=analysis["content"],
+            type=analysis["type"],
+            importance=analysis["importance"],
+        )
+
+    async def process_memory_after_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_reply: str,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """对话结束后：分析 importance，标注 session JSON，超阈值写入长期记忆。"""
+        settings = get_settings()
+        threshold = settings.memory_importance_threshold
+        analysis = await self.analyze_memory_candidate(
+            user_message,
+            assistant_reply,
+            history,
+        )
+        importance = float(analysis.get("importance") or 0)
+
+        if self.session_manager is not None:
+            self.session_manager.set_last_turn_importance(session_id, importance)
+
+        if importance > threshold and analysis.get("content"):
+            record = await self._store_memory_candidate(analysis)
+            if record is not None:
+                logger.info(
+                    "[Memory] importance=%.2f > %.2f，已写入记忆 id=%s type=%s",
+                    importance,
+                    threshold,
+                    record.id,
+                    record.type,
+                )
+        else:
+            logger.info(
+                "[Memory] importance=%.2f（阈值 %.2f），本轮不写入长期记忆",
+                importance,
+                threshold,
+            )
+        return analysis
 
 
 agent_manager = AgentManager()

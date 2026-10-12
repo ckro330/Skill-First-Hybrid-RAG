@@ -126,6 +126,10 @@ class SessionManager:
         content: str,
         tool_calls: list[dict[str, Any]] | None = None,
         retrieval_steps: list[dict[str, Any]] | None = None,
+        plan: dict[str, Any] | None = None,
+        agents: list[dict[str, Any]] | None = None,
+        a2a: list[dict[str, Any]] | None = None,
+        a2a_transcript: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         record = self._read_session_file(session_id)
         message: dict[str, Any] = {"role": role, "content": content}
@@ -133,9 +137,38 @@ class SessionManager:
             message["tool_calls"] = tool_calls
         if retrieval_steps:
             message["retrieval_steps"] = retrieval_steps
+        # 代码助手链路：planner 拆解、下游 agent 运行状态与 A2A 通信记录
+        if plan:
+            message["plan"] = plan
+        if agents:
+            message["agents"] = agents
+        if a2a:
+            message["a2a"] = a2a
+        if a2a_transcript:
+            message["a2a_transcript"] = a2a_transcript
         record["messages"].append(message)
         self._write_session(record)
         return message
+
+    def set_last_turn_importance(self, session_id: str, importance: float) -> None:
+        """给最后一轮（最后一条 user 消息及其后的 assistant 消息）标注 importance。"""
+        record = self._read_session_file(session_id)
+        messages = record.get("messages", [])
+        last_user_index = -1
+        for index, message in enumerate(messages):
+            if message.get("role") == "user":
+                last_user_index = index
+        if last_user_index < 0:
+            return
+        for message in messages[last_user_index:]:
+            message["importance"] = round(float(importance), 4)
+        self._write_session(record)
+
+    def set_last_turn_usage(self, session_id: str, usage: dict[str, Any]) -> None:
+        """把本轮的 token / 上下文缓存用量记到会话上，便于前端与复盘查看。"""
+        record = self._read_session_file(session_id)
+        record["last_turn_usage"] = usage
+        self._write_session(record)
 
     def get_history(self, session_id: str) -> dict[str, Any]:
         return self._read_session_file(session_id)
@@ -183,5 +216,3 @@ class SessionManager:
             "remaining_count": len(remaining),
         }
 
-    def get_compressed_context(self, session_id: str) -> str:
-        return self._read_session_file(session_id).get("compressed_context", "")

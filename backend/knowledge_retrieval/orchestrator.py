@@ -4,7 +4,7 @@ from typing import AsyncIterator
 
 from knowledge_retrieval.fusion import reciprocal_rank_fusion
 from knowledge_retrieval.hybrid_retriever import hybrid_retriever
-from backend.knowledge_retrieval.knowledge_retriever_agent import skill_retriever_agent
+from knowledge_retrieval.knowledge_retriever_agent import skill_retriever_agent
 from knowledge_retrieval.types import Evidence, OrchestratedRetrievalResult, RetrievalStep, SkillRetrievalResult
 
 

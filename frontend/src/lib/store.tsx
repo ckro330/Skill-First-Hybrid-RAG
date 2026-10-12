@@ -7,8 +7,6 @@ import {
   createSession,
   deleteSession,
   getKnowledgeIndexStatus,
-  getMemoryMode,
-  getRagMode,
   getSessionHistory,
   getSessionTokens,
   listSessions,
@@ -17,14 +15,17 @@ import {
   renameSession,
   rebuildKnowledgeIndex as rebuildKnowledgeIndexRequest,
   saveFile,
-  setRagMode,
-  setMemoryMode,
   streamChat,
+  type A2AMessage,
+  type AgentRun,
   type Evidence,
   type KnowledgeIndexStatus,
+  type PlanInfo,
+  type PlanTask,
   type RetrievalStep,
   type SessionSummary,
-  type ToolCall
+  type ToolCall,
+  type TurnUsage
 } from "@/lib/api";
 
 type Message = {
@@ -33,6 +34,10 @@ type Message = {
   content: string;
   toolCalls: ToolCall[];
   retrievalSteps: RetrievalStep[];
+  plan: PlanInfo | null;
+  agents: AgentRun[];
+  a2a: A2AMessage[];
+  a2aTranscript: A2AMessage[];
 };
 
 type TokenStats = {
@@ -46,8 +51,6 @@ type AppStore = {
   currentSessionId: string | null;
   messages: Message[];
   isStreaming: boolean;
-  ragMode: boolean;
-  memoryMode: boolean;
   skills: Array<{ name: string; description: string; path: string }>;
   editableFiles: string[];
   inspectorPath: string;
@@ -56,12 +59,11 @@ type AppStore = {
   sidebarWidth: number;
   inspectorWidth: number;
   tokenStats: TokenStats | null;
+  turnUsage: TurnUsage | null;
   knowledgeIndexStatus: KnowledgeIndexStatus | null;
   createNewSession: () => Promise<void>;
   selectSession: (sessionId: string) => Promise<void>;
   sendMessage: (value: string) => Promise<void>;
-  toggleRagMode: () => Promise<void>;
-  toggleMemoryMode: () => Promise<void>;
   renameCurrentSession: (title: string) => Promise<void>;
   removeSession: (sessionId: string) => Promise<void>;
   exportSessionLog: () => Promise<void>;
@@ -133,6 +135,93 @@ function normalizeRetrievalStep(value: unknown): RetrievalStep | null {
   };
 }
 
+function normalizePlanTask(value: unknown): PlanTask | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const item = value as Record<string, unknown>;
+  const dependsOn = Array.isArray(item.depends_on)
+    ? item.depends_on.map((entry) => String(entry))
+    : [];
+
+  return {
+    task_id: String(item.task_id ?? ""),
+    title: String(item.title ?? ""),
+    agent_id: String(item.agent_id ?? ""),
+    instruction: String(item.instruction ?? ""),
+    depends_on: dependsOn
+  };
+}
+
+function normalizePlan(value: unknown): PlanInfo | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const item = value as Record<string, unknown>;
+  const rawTasks = Array.isArray(item.tasks) ? item.tasks : [];
+
+  return {
+    domain: String(item.domain ?? ""),
+    reason: String(item.reason ?? ""),
+    stage: String(item.stage ?? ""),
+    multi_agent: Boolean(item.multi_agent),
+    tasks: rawTasks
+      .map((task) => normalizePlanTask(task))
+      .filter((task): task is PlanTask => task !== null)
+  };
+}
+
+/** planner 事件先到、orchestrator 的 plan 事件随后，后者带排序后的任务，前者带判定理由。 */
+function mergePlan(previous: PlanInfo | null, next: PlanInfo): PlanInfo {
+  if (!previous) {
+    return next;
+  }
+
+  return {
+    domain: next.domain || previous.domain,
+    reason: next.reason || previous.reason,
+    stage: next.stage || previous.stage,
+    multi_agent: next.multi_agent || previous.multi_agent,
+    tasks: next.tasks.length ? next.tasks : previous.tasks
+  };
+}
+
+function normalizeAgentRun(value: unknown): AgentRun | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const item = value as Record<string, unknown>;
+
+  return {
+    task_id: String(item.task_id ?? ""),
+    agent_id: String(item.agent_id ?? ""),
+    agent_name: String(item.agent_name ?? ""),
+    title: String(item.title ?? ""),
+    status: item.status === "running" ? "running" : "done"
+  };
+}
+
+function normalizeA2AMessage(value: unknown): A2AMessage | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const item = value as Record<string, unknown>;
+  const kind = item.kind === "task" || item.kind === "info" ? item.kind : "result";
+
+  return {
+    message_id: String(item.message_id ?? ""),
+    task_id: String(item.task_id ?? ""),
+    from: String(item.from ?? ""),
+    to: String(item.to ?? ""),
+    kind,
+    content: String(item.content ?? "")
+  };
+}
+
 function toUiMessages(history: Awaited<ReturnType<typeof getSessionHistory>>["messages"]) {
   return history.map((message) => ({
     id: makeId(),
@@ -141,7 +230,17 @@ function toUiMessages(history: Awaited<ReturnType<typeof getSessionHistory>>["me
     toolCalls: message.tool_calls ?? [],
     retrievalSteps: (message.retrieval_steps ?? [])
       .map((step) => normalizeRetrievalStep(step))
-      .filter((step): step is RetrievalStep => step !== null)
+      .filter((step): step is RetrievalStep => step !== null),
+    plan: normalizePlan(message.plan),
+    agents: (message.agents ?? [])
+      .map((run) => normalizeAgentRun(run))
+      .filter((run): run is AgentRun => run !== null),
+    a2a: (message.a2a ?? [])
+      .map((entry) => normalizeA2AMessage(entry))
+      .filter((entry): entry is A2AMessage => entry !== null),
+    a2aTranscript: (message.a2a_transcript ?? [])
+      .map((entry) => normalizeA2AMessage(entry))
+      .filter((entry): entry is A2AMessage => entry !== null)
   }));
 }
 
@@ -150,8 +249,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [ragMode, setRagModeState] = useState(false);
-  const [memoryMode, setMemoryModeState] = useState(false);
   const [skills, setSkills] = useState<Array<{ name: string; description: string; path: string }>>([]);
   const [inspectorPath, setInspectorPath] = useState("workspace/USER.md");
   const [inspectorContent, setInspectorContent] = useState("");
@@ -159,6 +256,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [sidebarWidth, setSidebarWidth] = useState(308);
   const [inspectorWidth, setInspectorWidth] = useState(360);
   const [tokenStats, setTokenStats] = useState<TokenStats | null>(null);
+  const [turnUsage, setTurnUsage] = useState<TurnUsage | null>(null);
   const [knowledgeIndexStatus, setKnowledgeIndexStatus] = useState<KnowledgeIndexStatus | null>(
     null
   );
@@ -224,14 +322,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
       role: "user",
       content: value.trim(),
       toolCalls: [],
-      retrievalSteps: []
+      retrievalSteps: [],
+      plan: null,
+      agents: [],
+      a2a: [],
+      a2aTranscript: []
     };
     const assistantMessage: Message = {
       id: makeId(),
       role: "assistant",
       content: "",
       toolCalls: [],
-      retrievalSteps: []
+      retrievalSteps: [],
+      plan: null,
+      agents: [],
+      a2a: [],
+      a2aTranscript: []
     };
 
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
@@ -297,13 +403,78 @@ export function AppProvider({ children }: { children: ReactNode }) {
               return;
             }
 
+            if (event === "planner" || event === "plan") {
+              const plan = normalizePlan(data);
+              if (!plan) {
+                return;
+              }
+              patchAssistant((message) => ({
+                ...message,
+                plan: mergePlan(message.plan, plan)
+              }));
+              return;
+            }
+
+            if (event === "agent_start") {
+              const run = normalizeAgentRun({
+                task_id: data.task_id,
+                agent_id: data.agent_id,
+                agent_name: data.agent_name,
+                title: data.title,
+                status: "running"
+              });
+              if (!run) {
+                return;
+              }
+              patchAssistant((message) => ({
+                ...message,
+                agents: [...message.agents, run]
+              }));
+              return;
+            }
+
+            if (event === "a2a") {
+              const a2aMessage = normalizeA2AMessage(data.message);
+              if (!a2aMessage) {
+                return;
+              }
+              patchAssistant((message) => ({
+                ...message,
+                a2a: [...message.a2a, a2aMessage]
+              }));
+              return;
+            }
+
+            if (event === "agent_result") {
+              patchAssistant((message) => ({
+                ...message,
+                content: message.content || String(data.content ?? ""),
+                agents: message.agents.map((run) =>
+                  run.task_id === String(data.task_id ?? "") ? { ...run, status: "done" } : run
+                )
+              }));
+              return;
+            }
+
+            if (event === "a2a_transcript") {
+              const transcript = (Array.isArray(data.messages) ? data.messages : [])
+                .map((entry) => normalizeA2AMessage(entry))
+                .filter((entry): entry is A2AMessage => entry !== null);
+              patchAssistant((message) => ({ ...message, a2aTranscript: transcript }));
+              return;
+            }
+
             if (event === "new_response") {
               const nextAssistant: Message = {
                 id: makeId(),
                 role: "assistant",
                 content: "",
                 toolCalls: [],
-                retrievalSteps: []
+                retrievalSteps: [],
+                plan: null,
+                agents: [],
+                a2a: [],
+                a2aTranscript: []
               };
               activeAssistantId = nextAssistant.id;
               setMessages((prev) => [...prev, nextAssistant]);
@@ -320,6 +491,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
                       content: finalContent
                     }
               );
+              return;
+            }
+
+            if (event === "usage") {
+              const promptTokens = Number(data.prompt_tokens ?? 0);
+              if (!promptTokens) {
+                return;
+              }
+              setTurnUsage({
+                llm_calls: Number(data.llm_calls ?? 0),
+                prompt_tokens: promptTokens,
+                output_tokens: Number(data.output_tokens ?? 0),
+                cache_hit_tokens: Number(data.cache_hit_tokens ?? 0),
+                cache_miss_tokens: Number(data.cache_miss_tokens ?? 0),
+                cache_hit_rate: Number(data.cache_hit_rate ?? 0)
+              });
               return;
             }
 
@@ -342,28 +529,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setIsStreaming(false);
       await refreshSessions();
       await refreshSessionDetails(sessionId);
-    }
-  }
-
-  async function toggleRagMode() {
-    const next = !ragMode;
-    setRagModeState(next);
-    try {
-      await setRagMode(next);
-    } catch (error) {
-      setRagModeState(!next);
-      throw error;
-    }
-  }
-
-  async function toggleMemoryMode() {
-    const next = !memoryMode;
-    setMemoryModeState(next);
-    try {
-      await setMemoryMode(next);
-    } catch (error) {
-      setMemoryModeState(!next);
-      throw error;
     }
   }
 
@@ -449,17 +614,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     void (async () => {
-      const [initialSessions, rag, memory, initialSkills, initialKnowledgeIndexStatus] = await Promise.all([
+      const [initialSessions, initialSkills, initialKnowledgeIndexStatus] = await Promise.all([
         listSessions(),
-        getRagMode(),
-        getMemoryMode(),
         listSkills(),
         getKnowledgeIndexStatus()
       ]);
 
       setSessions(initialSessions);
-      setRagModeState(rag.enabled);
-      setMemoryModeState(memory.enabled);
       setSkills(initialSkills);
       setKnowledgeIndexStatus(initialKnowledgeIndexStatus);
 
@@ -495,8 +656,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     currentSessionId,
     messages,
     isStreaming,
-    ragMode,
-    memoryMode,
     skills,
     editableFiles,
     inspectorPath,
@@ -505,12 +664,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     sidebarWidth,
     inspectorWidth,
     tokenStats,
+    turnUsage,
     knowledgeIndexStatus,
     createNewSession,
     selectSession,
     sendMessage,
-    toggleRagMode,
-    toggleMemoryMode,
     renameCurrentSession,
     removeSession,
     exportSessionLog,

@@ -4,10 +4,11 @@ import { useEffect, useRef } from "react";
 
 import { ChatInput } from "@/components/chat/ChatInput";
 import { ChatMessage } from "@/components/chat/ChatMessage";
+import { PlanCard } from "@/components/chat/PlanCard";
 import { useAppStore } from "@/lib/store";
 
 export function ChatPanel() {
-  const { messages, sendMessage, isStreaming, tokenStats, exportSessionLog } =
+  const { messages, sendMessage, isStreaming, tokenStats, turnUsage, exportSessionLog } =
     useAppStore();
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -33,8 +34,15 @@ export function ChatPanel() {
           >
             导出日志
           </button>
-          <div className="mono text-sm text-[var(--color-ink-soft)]">
-            {tokenStats ? `${tokenStats.total_tokens} tokens` : "No metrics yet"}
+          <div className="mono text-right text-sm text-[var(--color-ink-soft)]">
+            <div>{tokenStats ? `${tokenStats.total_tokens} tokens` : "No metrics yet"}</div>
+            {turnUsage ? (
+              <div className="text-[11px]" title="上一轮实际发给模型的 prompt token 与上下文缓存命中">
+                缓存命中 {(turnUsage.cache_hit_rate * 100).toFixed(0)}% ·{" "}
+                {turnUsage.cache_hit_tokens}/{turnUsage.prompt_tokens} tok ·{" "}
+                {turnUsage.llm_calls} 次调用
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -57,13 +65,20 @@ export function ChatPanel() {
           )}
 
           {messages.map((message) => (
-            <ChatMessage
-              content={message.content}
-              key={message.id}
-              retrievalSteps={message.retrievalSteps}
-              role={message.role}
-              toolCalls={message.toolCalls}
-            />
+            <div className="space-y-1" key={message.id}>
+              {message.role === "assistant" && message.plan ? (
+                <PlanCard agents={message.agents} plan={message.plan} />
+              ) : null}
+              <ChatMessage
+                a2a={message.a2a}
+                a2aTranscript={message.a2aTranscript}
+                agents={message.agents}
+                content={message.content}
+                retrievalSteps={message.retrievalSteps}
+                role={message.role}
+                toolCalls={message.toolCalls}
+              />
+            </div>
           ))}
           <div ref={endRef} />
         </div>

@@ -1,0 +1,27 @@
+%% team_graph.py 的 LangGraph 拓扑（对应 docs/langgraph-team-graph.png）
+%% 与 backend/agents/team_graph.py 的 build_team_graph() 一一对应
+flowchart TB
+    START([START]) --> SUP
+
+    SUP["supervisor<br/>父 agent（planner）"]
+    ROUTE{"route_after_supervisor<br/>current_task_id 空 → aggregate"}
+    SUP --> ROUTE
+
+    ROUTE --> A1["log_analysis_agent<br/>log-analysis-agent · log-analysis"]
+    ROUTE --> A2["code_modify_agent<br/>code-modify-agent · code-modification"]
+    ROUTE --> A3["test_agent<br/>test-agent · test-execution, test-authoring"]
+    ROUTE --> A4["git_agent<br/>git-agent · git-management"]
+    ROUTE -->|待办清空| AGG
+
+    A1 -->|add_edge| SUP
+    A2 -->|add_edge| SUP
+    A3 -->|add_edge| SUP
+    A4 -->|add_edge| SUP
+
+    AGG["aggregate<br/>父 agent 收尾：汇总子任务结果"] --> DONE([END])
+
+    subgraph STATE["TeamState（TypedDict, total=False）"]
+        direction LR
+        S1["request / tasks / pending<br/>current_task_id / upstream_text"]
+        S2["results / conversation_context<br/>dispatched / final_answer"]
+    end

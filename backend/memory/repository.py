@@ -212,9 +212,6 @@ class MemoryRepository:
             conn.commit()
         return row
 
-    def set_status(self, memory_id: str, status: str) -> dict[str, Any] | None:
-        return self.update(memory_id, status=status)
-
     def delete(self, memory_id: str) -> bool:
         self._check_available()
         with self._pool.connection() as conn:

@@ -1,16 +1,12 @@
 "use client";
 
-import { Bookmark, Database, FileSearch, Plus, Sparkles, Wrench } from "lucide-react";
+import { FileSearch, Plus, Sparkles, Wrench } from "lucide-react";
 
 import { useAppStore } from "@/lib/store";
 
 export function Navbar() {
   const {
     createNewSession,
-    ragMode,
-    toggleRagMode,
-    memoryMode,
-    toggleMemoryMode,
     compressCurrentSession,
     renameCurrentSession,
     rebuildKnowledgeIndex,
@@ -65,30 +61,6 @@ export function Navbar() {
         >
           <Plus size={16} />
           新会话
-        </button>
-        <button
-          className={`flex items-center gap-2 rounded-full px-4 py-2 text-sm ${
-            ragMode
-              ? "bg-ocean text-white"
-              : "border border-[var(--color-line)] bg-white/60 text-ink"
-          }`}
-          onClick={() => void toggleRagMode()}
-          type="button"
-        >
-          <Database size={16} />
-          {ragMode ? "RAG 已开" : "RAG 已关"}
-        </button>
-        <button
-          className={`flex items-center gap-2 rounded-full px-4 py-2 text-sm ${
-            memoryMode
-              ? "bg-ocean text-white"
-              : "border border-[var(--color-line)] bg-white/60 text-ink"
-          }`}
-          onClick={() => void toggleMemoryMode()}
-          type="button"
-        >
-          <Bookmark size={16} />
-          {memoryMode ? "记忆已开" : "记忆已关"}
         </button>
         <button
           className="flex items-center gap-2 rounded-full border border-[var(--color-line)] bg-white/60 px-4 py-2 text-sm"

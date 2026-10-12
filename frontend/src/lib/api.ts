@@ -22,6 +22,63 @@ export type RetrievalStep = {
   results: Evidence[];
 };
 
+export type PlanTask = {
+  task_id: string;
+  title: string;
+  agent_id: string;
+  instruction: string;
+  depends_on: string[];
+};
+
+export type PlanInfo = {
+  domain: string;
+  reason: string;
+  stage: string;
+  multi_agent: boolean;
+  tasks: PlanTask[];
+};
+
+export type AgentRun = {
+  task_id: string;
+  agent_id: string;
+  agent_name: string;
+  title: string;
+  status: "running" | "done";
+};
+
+export type A2AMessage = {
+  message_id: string;
+  task_id: string;
+  from: string;
+  to: string;
+  kind: "task" | "result" | "info";
+  content: string;
+};
+
+export const AGENT_LABELS: Record<string, string> = {
+  planner: "Planner",
+  "log-analysis-agent": "日志分析 Agent",
+  "code-modify-agent": "代码修改 Agent",
+  "test-agent": "测试 Agent",
+  "git-agent": "Git 管理 Agent"
+};
+
+export const DOMAIN_LABELS: Record<string, string> = {
+  coding: "代码任务",
+  rag: "知识库",
+  general: "通用问答"
+};
+
+export const A2A_KIND_LABELS: Record<string, string> = {
+  task: "派发",
+  result: "回传",
+  info: "通知"
+};
+
+export function agentLabel(agentId: string) {
+  return AGENT_LABELS[agentId] ?? (agentId || "未知 Agent");
+}
+
 export type KnowledgeIndexStatus = {
   ready: boolean;
   building: boolean;
@@ -29,6 +86,16 @@ export type KnowledgeIndexStatus = {
   indexed_files: number;
   vector_ready: boolean;
   bm25_ready: boolean;
+};
+
+/** 一轮对话的 LLM 用量（含上下文缓存命中），由后端 usage 事件推送。 */
+export type TurnUsage = {
+  llm_calls: number;
+  prompt_tokens: number;
+  output_tokens: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  cache_hit_rate: number;
 };
 
 export type SessionSummary = {
@@ -50,6 +117,10 @@ export type SessionHistory = {
     content: string;
     tool_calls?: ToolCall[];
     retrieval_steps?: RetrievalStep[];
+    plan?: PlanInfo;
+    agents?: AgentRun[];
+    a2a?: A2AMessage[];
+    a2a_transcript?: A2AMessage[];
   }>;
 };
 
@@ -143,28 +214,6 @@ export async function saveFile(path: string, content: string) {
   return request<{ ok: boolean; path: string }>("/files", {
     method: "POST",
     body: JSON.stringify({ path, content })
-  });
-}
-
-export async function getRagMode() {
-  return request<{ enabled: boolean }>("/config/rag-mode");
-}
-
-export async function setRagMode(enabled: boolean) {
-  return request<{ enabled: boolean }>("/config/rag-mode", {
-    method: "PUT",
-    body: JSON.stringify({ enabled })
-  });
-}
-
-export async function getMemoryMode() {
-  return request<{ enabled: boolean }>("/config/memory-mode");
-}
-
-export async function setMemoryMode(enabled: boolean) {
-  return request<{ enabled: boolean }>("/config/memory-mode", {
-    method: "PUT",
-    body: JSON.stringify({ enabled })
   });
 }
 

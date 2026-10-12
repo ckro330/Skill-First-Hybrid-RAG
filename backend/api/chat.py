@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -8,8 +9,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from graph.agent import agent_manager
+from graph.llm_usage import begin_turn, end_turn
 
 router = APIRouter()
+logger = logging.getLogger("chat")
 
 
 class ChatRequest(BaseModel):
@@ -23,7 +26,27 @@ def _sse(event: str, data: dict[str, Any]) -> str:
 
 
 def _new_segment() -> dict[str, Any]:
-    return {"content": "", "tool_calls": [], "retrieval_steps": []}
+    return {
+        "content": "",
+        "tool_calls": [],
+        "retrieval_steps": [],
+        "plan": None,
+        "agents": [],
+        "a2a": [],
+        "a2a_transcript": [],
+    }
+
+
+def _segment_has_content(segment: dict[str, Any]) -> bool:
+    return bool(
+        segment["content"].strip()
+        or segment["tool_calls"]
+        or segment["retrieval_steps"]
+        or segment["plan"]
+        or segment["agents"]
+        or segment["a2a"]
+        or segment["a2a_transcript"]
+    )
 
 
 @router.post("/chat")
@@ -44,6 +67,8 @@ async def chat(payload: ChatRequest):
         segments: list[dict[str, Any]] = []
         current_segment = _new_segment()
         conversation_saved = False
+        # 从本轮第一个 LLM 调用开始采集 token / 缓存命中
+        begin_turn()
 
         def persist_segments(fallback_content: str | None = None) -> None:
             #塞入current_segment和conversation_saved，在调用的时候改变
@@ -59,11 +84,7 @@ async def chat(payload: ChatRequest):
                 else:
                     current_segment["content"] = fallback_content
 
-            if (
-                current_segment["content"].strip()
-                or current_segment["tool_calls"]
-                or current_segment["retrieval_steps"]
-            ):
+            if _segment_has_content(current_segment):
                 segments.append(current_segment)
                 current_segment = _new_segment()
 
@@ -75,6 +96,10 @@ async def chat(payload: ChatRequest):
                     segment["content"],
                     tool_calls=segment["tool_calls"] or None,
                     retrieval_steps=segment["retrieval_steps"] or None,
+                    plan=segment["plan"],
+                    agents=segment["agents"] or None,
+                    a2a=segment["a2a"] or None,
+                    a2a_transcript=segment["a2a_transcript"] or None,
                 )
 
             conversation_saved = True
@@ -110,12 +135,51 @@ async def chat(payload: ChatRequest):
                             "results": event.get("results", []),
                         }
                     )
+                elif event_type == "planner":
+                    current_segment["plan"] = {
+                        "domain": event.get("domain", ""),
+                        "reason": event.get("reason", ""),
+                        "stage": event.get("stage", ""),
+                        "multi_agent": bool(event.get("multi_agent")),
+                        "tasks": event.get("tasks", []),
+                    }
+                elif event_type == "plan":
+                    existing_plan = current_segment["plan"] or {}
+                    current_segment["plan"] = {
+                        "domain": event.get("domain", existing_plan.get("domain", "")),
+                        "reason": event.get("reason", existing_plan.get("reason", "")),
+                        "stage": existing_plan.get("stage", "orchestrator"),
+                        "multi_agent": bool(
+                            event.get("multi_agent", existing_plan.get("multi_agent", False))
+                        ),
+                        "tasks": event.get("tasks", existing_plan.get("tasks", [])),
+                    }
+                elif event_type == "agent_start":
+                    current_segment["agents"].append(
+                        {
+                            "task_id": event.get("task_id", ""),
+                            "agent_id": event.get("agent_id", ""),
+                            "agent_name": event.get("agent_name", ""),
+                            "title": event.get("title", ""),
+                            "status": "running",
+                        }
+                    )
+                elif event_type == "a2a":
+                    message = event.get("message")
+                    if isinstance(message, dict):
+                        current_segment["a2a"].append(message)
+                elif event_type == "agent_result":
+                    for run in current_segment["agents"]:
+                        if run.get("task_id") == event.get("task_id"):
+                            run["status"] = "done"
+                    if not current_segment["content"].strip() and event.get("content"):
+                        current_segment["content"] = str(event["content"])
+                elif event_type == "a2a_transcript":
+                    messages = event.get("messages")
+                    if isinstance(messages, list):
+                        current_segment["a2a_transcript"] = messages
                 elif event_type == "new_response":
-                    if (
-                        current_segment["content"].strip()
-                        or current_segment["tool_calls"]
-                        or current_segment["retrieval_steps"]
-                    ):
+                    if _segment_has_content(current_segment):
                         segments.append(current_segment)
                     current_segment = _new_segment()
                 elif event_type == "done":
@@ -126,6 +190,12 @@ async def chat(payload: ChatRequest):
                 data = {key: value for key, value in event.items() if key != "type"}
                 yield _sse(event_type, data)
 
+                if event_type == "done":
+                    # 本轮所有 LLM 调用的用量（含上下文缓存命中）随对话一起落盘
+                    usage = end_turn()
+                    session_manager.set_last_turn_usage(payload.session_id, usage)
+                    yield _sse("usage", usage)
+
                 if event_type == "done" and is_first_user_message:
                     title = await agent_manager.generate_title(payload.message)
                     session_manager.set_title(payload.session_id, title)
@@ -133,6 +203,23 @@ async def chat(payload: ChatRequest):
                         "title",
                         {"session_id": payload.session_id, "title": title},
                     )
+
+                if event_type == "done":
+                    # 对话结束后的长期记忆分析：标注 importance，超阈值写入记忆库
+                    try:
+                        reply = "\n\n".join(
+                            segment["content"]
+                            for segment in segments
+                            if segment["content"].strip()
+                        )
+                        await agent_manager.process_memory_after_turn(
+                            payload.session_id,
+                            payload.message,
+                            reply,
+                            history,
+                        )
+                    except Exception as exc:
+                        logger.warning("[Memory] 对话后记忆分析失败: %s", exc)
         except Exception as exc:
             persist_segments(fallback_content=f"请求失败: {str(exc) or 'unknown error'}")
             yield _sse("error", {"error": str(exc)})
